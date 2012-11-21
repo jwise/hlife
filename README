@@ -1,0 +1,232 @@
+hlife, hdraw 0.96 by Radical Eye Software.
+
+Just an implementation of Gosper's hash life in C.  Makes efficient
+use of memory, includes garbage collection so the patterns can go
+further for the same amount of memory, and includes a fast X11 and
+windows display program so you can browse your huge universes.
+
+Executables for Linux/i386 and win32 are included.
+
+Usage:
+  hlife [-i increment] [-m maxgen] [-r rules] [-o outfile]
+        [-M maxmem] [-q] [-2] lifefile
+
+  hdraw [-i increment] [-m maxgen] [-r rules] [-o outfile]
+        [-M maxmem] [-q] [-2] lifefile
+
+The lifefile can be in either RLE or Alan Hensel's Life format 1.05 or
+1.06, or in my macrocell format.
+
+The program operates in four modes, depending on which combination of
+-i and -m are specified:
+
+ -i  -m
+ No  No   Run forever, and generate all generations that are a
+          power of two.  Unless invoked via hdraw, in which case
+          it just displays the given lifefile on the screen.
+ No  Yes  Go to maxgen (need not be a power of two).  It cannot go
+          directly there if maxgen is not a power of two since each
+          increment must be a power of two presently; instead, it
+          gets there by breaking maxgen into powers of two and taking
+          each step separately.
+ Yes No   Run forever generating every increment generations; the
+          increment must be a power of two.  The -o option is ignored
+          in this mode.
+ Yes Yes  Generate every increment generations until the generation
+          number is equal to or greater than maxgen; the increment
+          must be a power of two.
+
+Both increment and maxgen can be specified as a very long decimal
+number (such as 1234123412341234123412341234) or as a power of two
+with the notation 2^100.  Note that you must use 2^^100 on Windows
+since otherwise it gets interpreted as just 2100; don't ask me why.
+
+The -2 option overrides the selection of modes from the -i/-m options
+above and just says, only compute power of two intervals (as in
+the No/No option above), but you can combine it with a -i (interval
+to start with) and -m (stop if it gets this far).  The -2 -i
+combination is useful because sometimes the smaller powers of two
+take a long time to compute and reset the hash compared to the
+larger powers of 2; the -2 -m option is good when you don't want
+hashlife to totally run away which it frequently does.
+
+The rules can be specified as S23B3 or just 23/3 or b3s23 (for
+instance); only eight-neighbor outer totalistic rules are supported
+(although this is easily changed).
+
+The outfile is always written in macrocell format (the patterns
+often have more than a billion cells, much too large for either
+RLE or Hensel's format).
+
+The maxmem is specified in megabytes (approximately).  The program
+does not guarantee that it will not exceed this value, but it will
+make every effort.  In general, you should specify a value that is
+probably about 30M less than your machine has to leave memory for
+the operating system.  But try it out with various values; if your
+machine doesn't start swapping excessively, you're probably doing
+fine.  You should probably never specify a value larger than the
+total physical memory your machine has or you will probably swap for
+sure.
+
+The -q option says not to compute the population count at every
+increment.
+
+On some patterns this program works very very well (breeder,
+puftrain, metacatacryst) but on some it works very poorly
+(linepuf2); on these latter patterns a normal life program (such
+as my very fast qlife) will work much better.
+
+Screen Output
+
+As the program runs, it generates some screen output.  The meaning
+of the output is as follows:
+
+>> 1,024 3,993        This means generation 1024 has population 3993.
+{1331->9993}        The hash table increased in size from 1331 to 9993 entries.
+<13>                The program had to flush the results from 13 nodes.
+[99:13]             The program performed a GC and took memory usage from
+                    99% down to 13%.
+[->foo]             The program wrote output file foo.
+
+Sample Usage (assumes you have Alan Hensel's pattern library)
+
+   hlife -m 2^3000 pat/BREEDER.LIF
+
+Generates the 2^3000th generation of pat/BREEDER.LIF and prints its
+population.
+
+   hlife -m 1000000000 -o breeder.mc pat/BREEDER.LIF
+
+Generates the 1,000,000,000th generation of breeder (with
+1,302,084,180,212,404 cells) and places the output in the file
+breeder.mc.  The output is only about 52K in size; it would
+be thousands of terabytes in RLE, and even larger in Hensel's
+format.
+
+   hdraw breeder.mc
+
+Display that pattern on the screen.
+
+   hlife -i 2^30 pat/BREEDER.LIF
+
+Display every 2^30th generation of breeder.  This will go very fast.
+
+   hlife -o breeder.mc pat/BREEDER.LIF
+
+Generate every power of two generation of BREEDER.LIF, and put the
+output in files breeder.mc-0, breeder.mc-1, etc.  This will fill up
+your disk very quickly with breeder.mc* files if you are not careful.
+
+   hlife -m 2^30 -M 60 metacatacryst
+
+Generate metacatacryst generation 2^30 using at most 60M of memory.
+This will garbage collect a few times.
+
+Display Program Usage
+
+To use the display program hdraw, simply invoke
+
+   hdraw lifefile
+
+You can also give all of the hlife options, in which case hdraw will
+perform the computation just as hlife would before display.
+
+Once the window opens, you can use the arrow keys to pan, and + (or =)
+and - to zoom around.  If the screen appears blank, hit - a few times
+to zoom out until some portion of the pattern appears.  You can also
+click with the mouse to zoom in the area where you click.
+
+It is great fun to explore fractal-like patterns (such as metacatacryst)
+using hdraw.
+
+Compiling
+
+To compile these programs on Unix (typically):
+
+cc -O -o hlife hlife.c
+cc -O -o hdraw hdraw.c -L /usr/X11R6/lib -lX11
+
+On Windows:
+
+vcvars32
+cl hlife.c
+cl hdraw.c user32.lib gdi32.lib
+
+Macrocell Format
+
+The format of the macrocell file is just a listing of the
+macrocell nodes, one node per line.  The first line specifies the
+macrocell format with
+
+[M1] comment
+
+Every subsequent line is a node, starting with the node numbered one
+and proceeding sequentially.
+
+Each node has a level; this is the log base 2 of the number of bits
+on the edge that that node has.  Level 3 nodes (8x8) are represented
+as one-line pictures consisting of the characters '.' (off cell), '*'
+(on cell), and '$' (end of line).  Level 4 and above nodes are
+represented by five numbers:
+
+lev nw ne sw se
+
+where lev is the level and nw, ne, sw, and se are the node numbers of
+the children in the northwest, northeast, southwest, and southeast
+respectively.  If any node number is zero, this indicates that that
+child node is completely empty of any on-cells.
+
+All child nodes are guaranteed to be defined before the parent node
+is defined (depth-first traversal).  The last node of the file is
+the root node.
+
+So a simple glider:
+
+.*
+*
+***
+
+is represented with
+
+[M1] (hlife 0.96)
+$$$$$$$.*$
+*$***$
+4 0 1 0 2
+
+Open Questions
+
+Hashlife is great when it works, but when it doesn't, it really
+doesn't.  A simple example of when it doesn't is 
+
+   hlife -r 2/1 -m 512 dot.lif
+
+where dot.lif is simply
+
+#Life1.05
+*
+
+To compute generation 512, hlife takes 18 seconds and consumes >140M
+of memory and generates more than 6M nodes!  By comparison, qlife
+takes only 1.6 seconds and consumes <1M of memory.
+
+A lot of this speed discrepancy is probably just due to the fact that
+hlife really thrashes the TLB and data cache, where qlife does very
+well with the TLB and data cache.  But the discrepency in memory
+consumption is quite dramatic.
+
+Specifically, hashlife is a recursive algorithm that
+gains its speed through the use of a cache.  This cache means that
+essentially every (really every other) generation of a highly
+chaotic pattern is stored in memory.
+
+If hlife starts garbage collecting a lot (where a lot is perhaps
+more than about 20 times per step), then things can get even slower,
+even exponentially slower, as garbage collecting the cache turns
+the polynomial-time cached recursive algorithm into an
+exponential-time recursive algorithm.
+
+So, an interesting question is, is there is a hybrid or other
+algorithm that has the speed and performance of hlife when the pattern
+is regular, but the speed and performance of qlife (or a normal life
+algorithm) when the pattern is not?  Perhaps an algorithm that
+adapts?  I do not yet have an answer, but I'm working on one!
