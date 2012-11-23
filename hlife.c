@@ -17,6 +17,8 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <inttypes.h>
+#include <sys/time.h>
 /*
  *   Into instances of this node structure is where almost all of the
  *   memory allocated by this program goes.  Thus, it is imperative we
@@ -103,10 +105,15 @@
  *   this together, and you get the following structure for the 16-squares
  *   and larger:
  */
+typedef uint32_t noderef_t;
+/* A noderef_t is 1 bit of GC status, 10 bits worth of offset, and 21 bits worth of allocation number. */
 struct node {
-   struct node *next ;              /* hash link */
-   struct node *nw, *ne, *sw, *se ; /* constant; nw != 0 means nonleaf */
-   struct node *res ;               /* cache */
+   noderef_t next ;              /* hash link */
+   noderef_t nw, ne, sw, se; /* constant; nw != 0 means nonleaf */
+   union {
+     noderef_t res ;               /* cache */
+     int *resp; /* Sigh. */
+   };
 } ;
 /*
  *   For the 8-squares, we do not have `children', we have actual data
@@ -132,8 +139,8 @@ struct node {
  *   so on.
  */
 struct leaf {
-   struct node *next ;              /* hash link */
-   struct node *isnode ;            /* must always be zero for leaves */
+   noderef_t next ;              /* hash link */
+   noderef_t isnode ;            /* must always be zero for leaves */
    unsigned short nw, ne, sw, se ;  /* constant */
    unsigned short res1, res2 ;      /* constant */
 } ;
@@ -141,12 +148,25 @@ struct leaf {
  *   If it is a struct node, this returns a non-zero value, otherwise it
  *   returns a zero value.
  */
-#define is_node(n) (((struct node *)(n))->nw)
+#define is_node(n) (((struct leaf *)(n))->isnode)
+
+/* The allocations come in generations -- to make it easier to look up a certain node or leaf, we put them in a union... */
+union nodeleaf {
+  struct leaf l;
+  struct node n;
+};
+union nodeleaf **allocs = NULL;
+int nallocs = 0;
+#define ALLOCSZ 0x400
+#define deref(nr)   ({noderef_t __NR = (nr); &(allocs[(__NR) >> 11][((__NR) >> 1) & 0x3FF].n);})
+#define deref_l(nr) ({noderef_t __NR = (nr); &(allocs[(__NR) >> 11][((__NR) >> 1) & 0x3FF].l);})
+#define ref(a, p) (((a) << 11) | ((p) << 1))
+
 /*
  *   A key datastructure is our hash table; we use a simple bucket hash.
  */
 unsigned int hashpop, hashlimit, hashprime = 100000 ;
-struct node **hashtab ;
+noderef_t *hashtab ;
 /*
  *   Prime hash sizes tend to work best.
  */
@@ -235,13 +255,13 @@ void leafres(struct leaf *n) {
  *   we need.  Each of these allocators actually *copy* an existing node
  *   in all of its fields.
  */
-struct node *newnode() ;
-struct leaf *newleaf() ;
+noderef_t newnode();
+noderef_t newleaf();
 /*
  *   We do now support garbage collection, but there are some routines we
  *   call frequently to help us.
  */
-struct node *save() ;
+noderef_t save(noderef_t) ;
 void clearstack(), pop() ;
 int gsp ;
 unsigned int alloced, maxmem = 2000000000 ;
@@ -252,10 +272,11 @@ unsigned int alloced, maxmem = 2000000000 ;
  */
 void resize() {
    int i, nhashprime = nextprime(2 * hashprime) ;
-   struct node *p, **nhashtab ;
+   noderef_t p;
+   noderef_t *nhashtab ;
    struct timeval t1, t2;
-   if (nhashprime * sizeof(struct node *) > maxmem - alloced) {
-      fprintf(stderr, "{no memory for new hash tablel}");
+   if (nhashprime * sizeof(noderef_t *) > maxmem - alloced) {
+      fprintf(stderr, "{no memory for new hash table}");
       hashlimit = 2000000000 ;
       return ;
    }
@@ -272,22 +293,23 @@ void resize() {
          return ;
       }
    }
-   nhashtab = (struct node **)calloc(nhashprime, sizeof(struct node *)) ;
-   alloced += sizeof(struct node *) * (nhashprime - hashprime) ;
+   nhashtab = (noderef_t *)calloc(nhashprime, sizeof(noderef_t)) ;
+   alloced += sizeof(noderef_t) * (nhashprime - hashprime) ;
    fprintf(stderr, "{%d->%d", hashprime, nhashprime) ;
    gettimeofday(&t1, NULL);
    for (i=0; i<hashprime; i++) {
       for (p=hashtab[i]; p;) {
-         struct node *np = p->next ;
+         struct node *ps = deref(p);
+         noderef_t np = ps->next;
          unsigned int h ;
-         if (is_node(p)) {
-            h = node_hash(p->nw, p->ne, p->sw, p->se) ;
+         if (is_node(ps)) {
+            h = node_hash(ps->nw, ps->ne, ps->sw, ps->se) ;
          } else {
-            struct leaf *l = (struct leaf *)p ;
+            struct leaf *l = (struct leaf *)ps ;
             h = leaf_hash(l->nw, l->ne, l->sw, l->se) ;
          }
          h %= nhashprime ;
-         p->next = nhashtab[h] ;
+         ps->next = nhashtab[h] ;
          nhashtab[h] = p ;
          p = np ;
       }
@@ -308,13 +330,14 @@ unsigned int hits ;
  *   find it in the hash table, we return it; otherwise, we build a
  *   new node and store it in the hash table, and return that.
  */
-struct node *find_node(struct node *nw, struct node *ne,
-                       struct node *sw, struct node *se) {
+noderef_t find_node(noderef_t nw, noderef_t ne,
+                    noderef_t sw, noderef_t se) {
    struct node *p ;
+   noderef_t pr;
    unsigned int h = node_hash(nw,ne,sw,se) ;
    struct node *pred = 0 ;
    h = h % hashprime ;
-   for (p=hashtab[h]; p; p = p->next) { /* make sure to compare nw *first* */
+   for (pr=hashtab[h]; pr && (p=deref(pr)); pr = p->next) { /* make sure to compare nw *first* */
       if (nw == p->nw && ne == p->ne && sw == p->sw && se == p->se) {
 #ifdef TRACE
          hits++ ;
@@ -322,13 +345,14 @@ struct node *find_node(struct node *nw, struct node *ne,
          if (pred) { /* move this one to the front */
             pred->next = p->next ;
             p->next = hashtab[h] ;
-            hashtab[h] = p ;
+            hashtab[h] = pr ;
          }
-         return save(p) ;
+         return save(pr) ;
       }
       pred = p ;
    }
-   p = newnode() ;
+   pr = newnode() ;
+   p = deref(pr);
    p->nw = nw ;
    p->ne = ne ;
    p->sw = sw ;
@@ -343,19 +367,20 @@ struct node *find_node(struct node *nw, struct node *ne,
                                          node_depth(p), nw, ne, sw, se, p) ;
 #endif
    p->next = hashtab[h] ;
-   hashtab[h] = p ;
+   hashtab[h] = pr ;
    hashpop++ ;
    if (hashpop > hashlimit)
       resize() ;
-   return save(p) ;
+   return save(pr);
 }
-struct leaf *find_leaf(unsigned short nw, unsigned short ne,
+noderef_t find_leaf(unsigned short nw, unsigned short ne,
                        unsigned short sw, unsigned short se) {
    struct leaf *p ;
+   noderef_t pr;
    struct leaf *pred = 0 ;
    unsigned int h = leaf_hash(nw, ne, sw, se) ;
    h = h % hashprime ;
-   for (p=(struct leaf *)hashtab[h]; p; p = (struct leaf *)p->next) {
+   for (pr=hashtab[h]; pr && (p=(struct leaf *)deref(pr)); pr = p->next) {
       if (nw == p->nw && ne == p->ne && sw == p->sw && se == p->se &&
           !is_node(p)) {
 #ifdef TRACE
@@ -364,13 +389,14 @@ struct leaf *find_leaf(unsigned short nw, unsigned short ne,
          if (pred) {
             pred->next = p->next ;
             p->next = hashtab[h] ;
-            hashtab[h] = (struct node *)p ;
+            hashtab[h] = pr ;
          }
-         return (struct leaf *)save((struct node *)p) ;
+         return save(pr) ;
       }
       pred = p ;
    }
-   p = newleaf() ;
+   pr = newleaf();
+   p = (struct leaf *)deref(pr);
    p->nw = nw ;
    p->ne = ne ;
    p->sw = sw ;
@@ -386,24 +412,24 @@ struct leaf *find_leaf(unsigned short nw, unsigned short ne,
 #endif
    p->isnode = 0 ;
    p->next = hashtab[h] ;
-   hashtab[h] = (struct node *)p ;
+   hashtab[h] = pr ;
    hashpop++ ;
    if (hashpop > hashlimit)
       resize() ;
-   return (struct leaf *)save((struct node *)p) ;
+   return save(pr) ;
 }
 /*
  *   We've shown how to calculate the result for an 8-square.  What about
  *   the bigger squares?  Well, let's assume we have the following
  *   routines that do that work the hard way.
  */
-struct leaf *dorecurs_leaf() ;
-struct leaf *dorecurs_leaf_half() ;
-struct leaf *dorecurs_leaf_quarter() ;
-struct node *dorecurs() ;
-struct node *dorecurs_half() ;
+noderef_t dorecurs_leaf() ;
+noderef_t dorecurs_leaf_half() ;
+noderef_t dorecurs_leaf_quarter() ;
+noderef_t dorecurs() ;
+noderef_t dorecurs_half() ;
 int ngens = 0 ; /* must be a power of two */
-int node_depth(struct node *) ;
+int node_depth(noderef_t) ;
 /*
  *   The following routine does the same, but first it checks to see if
  *   the cached result is any good.  If it is, it directly returns that.
@@ -413,7 +439,8 @@ int node_depth(struct node *) ;
  *   stack pointer and garbage collection stuff.
  */
 int halvesdone ;
-struct node *getres(struct node *n, int depth) {
+noderef_t getres(noderef_t nr, int depth) {
+   struct node *n = deref(nr);
    if (n->res == 0) {
       int sp = gsp ;
 #ifdef TRACE
@@ -421,22 +448,20 @@ struct node *getres(struct node *n, int depth) {
 #endif
       depth-- ;
       if (ngens >= depth) {
-         if (is_node(n->nw)) {
+         if (is_node(deref(n->nw))) {
             n->res = dorecurs(n->nw, n->ne, n->sw, n->se, depth) ;
          } else {
-            n->res = (struct node *)dorecurs_leaf(n->nw, n->ne, n->sw, n->se) ;
+            n->res = dorecurs_leaf(n->nw, n->ne, n->sw, n->se) ;
          }
       } else {
          if (halvesdone < 1000)
             halvesdone++ ;
-         if (is_node(n->nw)) {
+         if (is_node(deref(n->nw))) {
             n->res = dorecurs_half(n->nw, n->ne, n->sw, n->se, depth) ;
          } else if (ngens == 0) {
-            n->res = (struct node *)dorecurs_leaf_quarter(n->nw, n->ne,
-                                                          n->sw, n->se) ;
+            n->res = dorecurs_leaf_quarter(n->nw, n->ne, n->sw, n->se) ;
          } else {
-            n->res = (struct node *)dorecurs_leaf_half(n->nw, n->ne,
-                                                       n->sw, n->se) ;
+            n->res = dorecurs_leaf_half(n->nw, n->ne, n->sw, n->se) ;
          }
       }
       pop(sp) ;
@@ -455,68 +480,88 @@ struct node *getres(struct node *n, int depth) {
  *   9 n/4-squares, use those to calculate 4 more n/4-squares, and
  *   then put these together into a new n/2-square.  Simple, eh?
  */
-struct node *dorecurs(struct node *n, struct node *ne, struct node *t,
-                      struct node *e, int depth) {
+noderef_t dorecurs(noderef_t nr, noderef_t ner, noderef_t tr,
+                   noderef_t er, int depth) {
    int sp = gsp ;
    struct node
-   *t00 = getres(n, depth),
-   *t01 = getres(find_node(n->ne, ne->nw, n->se, ne->sw), depth),
-   *t02 = getres(ne, depth),
-   *t12 = getres(find_node(ne->sw, ne->se, e->nw, e->ne), depth),
-   *t11 = getres(find_node(n->se, ne->sw, t->ne, e->nw), depth),
-   *t10 = getres(find_node(n->sw, n->se, t->nw, t->ne), depth),
-   *t20 = getres(t, depth),
-   *t21 = getres(find_node(t->ne, e->nw, t->se, e->sw), depth),
-   *t22 = getres(e, depth),
-   *t33 = getres(find_node(t00, t01, t10, t11), depth),
-   *t34 = getres(find_node(t01, t02, t11, t12), depth),
-   *t44 = getres(find_node(t11, t12, t21, t22), depth),
-   *t43 = getres(find_node(t10, t11, t20, t21), depth) ;
-   n = find_node(t33, t34, t43, t44) ;
+   *n = deref(nr),
+   *ne = deref(ner),
+   *t = deref(tr),
+   *e = deref(er);
+   noderef_t
+   t00 = getres(nr, depth),
+   t01 = getres(find_node(n->ne, ne->nw, n->se, ne->sw), depth),
+   t02 = getres(ner, depth),
+   t12 = getres(find_node(ne->sw, ne->se, e->nw, e->ne), depth),
+   t11 = getres(find_node(n->se, ne->sw, t->ne, e->nw), depth),
+   t10 = getres(find_node(n->sw, n->se, t->nw, t->ne), depth),
+   t20 = getres(tr, depth),
+   t21 = getres(find_node(t->ne, e->nw, t->se, e->sw), depth),
+   t22 = getres(er, depth),
+   t33 = getres(find_node(t00, t01, t10, t11), depth),
+   t34 = getres(find_node(t01, t02, t11, t12), depth),
+   t44 = getres(find_node(t11, t12, t21, t22), depth),
+   t43 = getres(find_node(t10, t11, t20, t21), depth) ;
+   nr = find_node(t33, t34, t43, t44) ;
    pop(sp) ;
-   return save(n) ;
+   return save(nr) ;
 }
 /*
  *   Same as above, but we only do one step instead of 2.
  */
-struct node *dorecurs_half(struct node *n, struct node *ne, struct node *t,
-                           struct node *e, int depth) {
+noderef_t dorecurs_half(noderef_t nr, noderef_t ner, noderef_t tr,
+                        noderef_t er, int depth) {
    int sp = gsp ;
    struct node
-   *t00 = getres(n, depth),
-   *t01 = getres(find_node(n->ne, ne->nw, n->se, ne->sw), depth),
-   *t10 = getres(find_node(n->sw, n->se, t->nw, t->ne), depth),
-   *t11 = getres(find_node(n->se, ne->sw, t->ne, e->nw), depth),
-   *t02 = getres(ne, depth),
-   *t12 = getres(find_node(ne->sw, ne->se, e->nw, e->ne), depth),
-   *t20 = getres(t, depth),
-   *t21 = getres(find_node(t->ne, e->nw, t->se, e->sw), depth),
-   *t22 = getres(e, depth) ;
+   *n = deref(nr),
+   *ne = deref(ner),
+   *t = deref(tr),
+   *e = deref(er);
+   noderef_t
+   t00r = getres(nr, depth),
+   t01r = getres(find_node(n->ne, ne->nw, n->se, ne->sw), depth),
+   t10r = getres(find_node(n->sw, n->se, t->nw, t->ne), depth),
+   t11r = getres(find_node(n->se, ne->sw, t->ne, e->nw), depth),
+   t02r = getres(ner, depth),
+   t12r = getres(find_node(ne->sw, ne->se, e->nw, e->ne), depth),
+   t20r = getres(tr, depth),
+   t21r = getres(find_node(t->ne, e->nw, t->se, e->sw), depth),
+   t22r = getres(er, depth) ;
+   struct node
+   *t00 = deref(t00r),
+   *t01 = deref(t01r),
+   *t10 = deref(t10r),
+   *t11 = deref(t11r),
+   *t02 = deref(t02r),
+   *t12 = deref(t12r),
+   *t20 = deref(t20r),
+   *t21 = deref(t21r),
+   *t22 = deref(t22r);
    if (depth > 3) {
-      n = find_node(find_node(t00->se, t01->sw, t10->ne, t11->nw),
-                    find_node(t01->se, t02->sw, t11->ne, t12->nw),
-                    find_node(t10->se, t11->sw, t20->ne, t21->nw),
-                    find_node(t11->se, t12->sw, t21->ne, t22->nw)) ;
+      nr = find_node(find_node(t00->se, t01->sw, t10->ne, t11->nw),
+                     find_node(t01->se, t02->sw, t11->ne, t12->nw),
+                     find_node(t10->se, t11->sw, t20->ne, t21->nw),
+                     find_node(t11->se, t12->sw, t21->ne, t22->nw)) ;
    } else {
-      n = find_node((struct node *)find_leaf(((struct leaf *)t00)->se,
-                                             ((struct leaf *)t01)->sw,
-                                             ((struct leaf *)t10)->ne,
-                                             ((struct leaf *)t11)->nw),
-                    (struct node *)find_leaf(((struct leaf *)t01)->se,
-                                             ((struct leaf *)t02)->sw,
-                                             ((struct leaf *)t11)->ne,
-                                             ((struct leaf *)t12)->nw),
-                    (struct node *)find_leaf(((struct leaf *)t10)->se,
-                                             ((struct leaf *)t11)->sw,
-                                             ((struct leaf *)t20)->ne,
-                                             ((struct leaf *)t21)->nw),
-                    (struct node *)find_leaf(((struct leaf *)t11)->se,
-                                             ((struct leaf *)t12)->sw,
-                                             ((struct leaf *)t21)->ne,
-                                             ((struct leaf *)t22)->nw)) ;
+      nr = find_node(find_leaf(((struct leaf *)t00)->se,
+                               ((struct leaf *)t01)->sw,
+                               ((struct leaf *)t10)->ne,
+                               ((struct leaf *)t11)->nw),
+                     find_leaf(((struct leaf *)t01)->se,
+                               ((struct leaf *)t02)->sw,
+                               ((struct leaf *)t11)->ne,
+                               ((struct leaf *)t12)->nw),
+                     find_leaf(((struct leaf *)t10)->se,
+                               ((struct leaf *)t11)->sw,
+                               ((struct leaf *)t20)->ne,
+                               ((struct leaf *)t21)->nw),
+                     find_leaf(((struct leaf *)t11)->se,
+                               ((struct leaf *)t12)->sw,
+                               ((struct leaf *)t21)->ne,
+                               ((struct leaf *)t22)->nw)) ;
    }
    pop(sp) ;
-   return save(n) ;
+   return save(nr) ;
 }
 /*
  *   If the node is a 16-node, then the constituents are leaves, so we
@@ -524,39 +569,47 @@ struct node *dorecurs_half(struct node *n, struct node *ne, struct node *t,
  *   we do not (yet) garbage collect leaves, we don't need all that
  *   save/pop mumbo-jumbo.
  */
-struct leaf *dorecurs_leaf(struct leaf *n, struct leaf *ne, struct leaf *t,
-                           struct leaf *e) {
+noderef_t dorecurs_leaf(noderef_t nr, noderef_t ner, noderef_t tr, noderef_t er) {
+   struct leaf
+   *n = deref_l(nr),
+   *ne = deref_l(ner),
+   *t = deref_l(tr),
+   *e = deref_l(er);
    unsigned short
    t00 = n->res2,
-   t01 = find_leaf(n->ne, ne->nw, n->se, ne->sw)->res2,
+   t01 = deref_l(find_leaf(n->ne, ne->nw, n->se, ne->sw))->res2,
    t02 = ne->res2,
-   t10 = find_leaf(n->sw, n->se, t->nw, t->ne)->res2,
-   t11 = find_leaf(n->se, ne->sw, t->ne, e->nw)->res2,
-   t12 = find_leaf(ne->sw, ne->se, e->nw, e->ne)->res2,
+   t10 = deref_l(find_leaf(n->sw, n->se, t->nw, t->ne))->res2,
+   t11 = deref_l(find_leaf(n->se, ne->sw, t->ne, e->nw))->res2,
+   t12 = deref_l(find_leaf(ne->sw, ne->se, e->nw, e->ne))->res2,
    t20 = t->res2,
-   t21 = find_leaf(t->ne, e->nw, t->se, e->sw)->res2,
+   t21 = deref_l(find_leaf(t->ne, e->nw, t->se, e->sw))->res2,
    t22 = e->res2 ;
-   return find_leaf(find_leaf(t00, t01, t10, t11)->res2,
-                    find_leaf(t01, t02, t11, t12)->res2,
-                    find_leaf(t10, t11, t20, t21)->res2,
-                    find_leaf(t11, t12, t21, t22)->res2) ;
+   return find_leaf(deref_l(find_leaf(t00, t01, t10, t11))->res2,
+                    deref_l(find_leaf(t01, t02, t11, t12))->res2,
+                    deref_l(find_leaf(t10, t11, t20, t21))->res2,
+                    deref_l(find_leaf(t11, t12, t21, t22))->res2) ;
 }
 /*
  *   Same as above but we only do two generations.
  */
 #define combine4(t00,t01,t10,t11) (unsigned short)\
 ((((t00)<<10)&0xcc00)|(((t01)<<6)&0x3300)|(((t10)>>6)&0xcc)|(((t11)>>10)&0x33))
-struct leaf *dorecurs_leaf_half(struct leaf *n, struct leaf *ne, struct leaf *t,
-                                struct leaf *e) {
+noderef_t dorecurs_leaf_half(noderef_t nr, noderef_t ner, noderef_t tr, noderef_t er) {
+   struct leaf
+   *n = deref_l(nr),
+   *ne = deref_l(ner),
+   *t = deref_l(tr),
+   *e = deref_l(er);
    unsigned short
    t00 = n->res2,
-   t01 = find_leaf(n->ne, ne->nw, n->se, ne->sw)->res2,
+   t01 = deref_l(find_leaf(n->ne, ne->nw, n->se, ne->sw))->res2,
    t02 = ne->res2,
-   t10 = find_leaf(n->sw, n->se, t->nw, t->ne)->res2,
-   t11 = find_leaf(n->se, ne->sw, t->ne, e->nw)->res2,
-   t12 = find_leaf(ne->sw, ne->se, e->nw, e->ne)->res2,
+   t10 = deref_l(find_leaf(n->sw, n->se, t->nw, t->ne))->res2,
+   t11 = deref_l(find_leaf(n->se, ne->sw, t->ne, e->nw))->res2,
+   t12 = deref_l(find_leaf(ne->sw, ne->se, e->nw, e->ne))->res2,
    t20 = t->res2,
-   t21 = find_leaf(t->ne, e->nw, t->se, e->sw)->res2,
+   t21 = deref_l(find_leaf(t->ne, e->nw, t->se, e->sw))->res2,
    t22 = e->res2 ;
    return find_leaf(combine4(t00, t01, t10, t11),
                     combine4(t01, t02, t11, t12),
@@ -566,17 +619,21 @@ struct leaf *dorecurs_leaf_half(struct leaf *n, struct leaf *ne, struct leaf *t,
 /*
  *   Same as above but we only do one generation.
  */
-struct leaf *dorecurs_leaf_quarter(struct leaf *n, struct leaf *ne,
-                                   struct leaf *t, struct leaf *e) {
+noderef_t dorecurs_leaf_quarter(noderef_t nr, noderef_t ner, noderef_t tr, noderef_t er) {
+   struct leaf
+   *n = deref_l(nr),
+   *ne = deref_l(ner),
+   *t = deref_l(tr),
+   *e = deref_l(er);
    unsigned short
    t00 = n->res1,
-   t01 = find_leaf(n->ne, ne->nw, n->se, ne->sw)->res1,
+   t01 = deref_l(find_leaf(n->ne, ne->nw, n->se, ne->sw))->res1,
    t02 = ne->res1,
-   t10 = find_leaf(n->sw, n->se, t->nw, t->ne)->res1,
-   t11 = find_leaf(n->se, ne->sw, t->ne, e->nw)->res1,
-   t12 = find_leaf(ne->sw, ne->se, e->nw, e->ne)->res1,
+   t10 = deref_l(find_leaf(n->sw, n->se, t->nw, t->ne))->res1,
+   t11 = deref_l(find_leaf(n->se, ne->sw, t->ne, e->nw))->res1,
+   t12 = deref_l(find_leaf(ne->sw, ne->se, e->nw, e->ne))->res1,
    t20 = t->res1,
-   t21 = find_leaf(t->ne, e->nw, t->se, e->sw)->res1,
+   t21 = deref_l(find_leaf(t->ne, e->nw, t->se, e->sw))->res1,
    t22 = e->res1 ;
    return find_leaf(combine4(t00, t01, t10, t11),
                     combine4(t01, t02, t11, t12),
@@ -594,27 +651,33 @@ void do_gc() ;
  *   We keep free nodes in a linked list for allocation, and we allocate
  *   them 1000 at a time.
  */
-struct node *freenodes ;
+int curallocblk = 0;
+noderef_t freenodes = 0;
 int okaytogc = 0 ;           /* only true when we're running generations. */
 int totalthings = 0 ;
-struct node *nodeblocks = 0 ;
-struct node *newnode() {
-   struct node *r ;
+noderef_t newnode() {
+   noderef_t r;
    if (freenodes == 0) {
       int i ;
-      freenodes = calloc(1001, sizeof(struct node)) ;
-      alloced += 1001 * sizeof(struct node) ;
-      freenodes->next = nodeblocks ;
-      nodeblocks = freenodes++ ;
-      for (i=0; i<999; i++) {
-         freenodes[1].next = freenodes ;
-         freenodes++ ;
+      
+      curallocblk++;
+      if (curallocblk >= nallocs) {
+         if (!nallocs)
+            nallocs = 1;
+         nallocs *= 2;
+         allocs = realloc(allocs, sizeof(union nodeleaf *) * nallocs);
       }
+      allocs[curallocblk] = calloc(ALLOCSZ, sizeof(union nodeleaf));
+      freenodes = curallocblk << 11;
+      alloced += ALLOCSZ * sizeof(union nodeleaf) ;
+      for (i = 0; i < ALLOCSZ; i++)
+         allocs[curallocblk][i].n.next = (curallocblk << 11) | ((i + 1) << 1);
+      allocs[curallocblk][ALLOCSZ-1].n.next = 0;
       if (alloced > maxmem)
          fprintf(stderr, "N") ;
-      totalthings += 1000 ;
+      totalthings += ALLOCSZ ;
    }
-   if (freenodes->next == 0 && alloced + 1000 * sizeof(struct node) > maxmem &&
+   if (deref(freenodes)->next == 0 && alloced + ALLOCSZ * sizeof(union nodeleaf) > maxmem &&
        okaytogc) {
       if (die_if_gc) {
          fprintf(stderr, "Dying because out of memory\n") ;
@@ -623,51 +686,25 @@ struct node *newnode() {
       do_gc('n') ;
    }
    r = freenodes ;
-   freenodes = freenodes->next ;
+   freenodes = deref(freenodes)->next ;
    return r ;
 }
-/*
- *   Leaves are the same.
- */
-struct leaf *freeleaves ;
-struct leaf *leafblocks = 0 ;
-struct leaf *newleaf() {
-   struct leaf *r ;
-   if (freeleaves == 0) {
-      int i ;
-      freeleaves = calloc(1001, sizeof(struct leaf)) ;
-      alloced += 1001 * sizeof(struct leaf) ;
-      freeleaves->next = (struct node *)leafblocks ;
-      leafblocks = freeleaves++ ;
-      for (i=0; i<999; i++) {
-         freeleaves[1].next = (struct node *)freeleaves ;
-         freeleaves++ ;
-      }
-      if (alloced > maxmem)
-         fprintf(stderr, "L") ;
-      totalthings += 1000 ;
-   }
-   if (freeleaves->next == 0 && alloced + 1000 * sizeof(struct leaf) > maxmem &&
-       okaytogc) {
-      if (die_if_gc) {
-         fprintf(stderr, "Dying because out of memory\n") ;
-         exit(10) ;
-      }
-      do_gc('l') ;
-   }
-   r = freeleaves ;
-   freeleaves = (struct leaf *)freeleaves->next ;
-   return r ;
-}
+
+noderef_t newleaf() { return newnode(); }
+
 /*
  *   Sometimes we want the new node or leaf to be automatically cleared
  *   for us.
  */
-struct node *newclearednode() {
-   return memset(newnode(), 0, sizeof(struct node)) ;
+noderef_t newclearednode() {
+   noderef_t r = newnode();
+   memset(deref(r), 0, sizeof(struct node));
+   return r;
 }
-struct leaf *newclearedleaf() {
-   return memset(newleaf(), 0, sizeof(struct leaf)) ;
+noderef_t newclearedleaf() {
+   noderef_t r = newleaf();
+   memset(deref(r), 0, sizeof(struct leaf));
+   return r;
 }
 /*
  *   These are the rules we run.  Note that these rules in the birth
@@ -691,9 +728,9 @@ char health[10] ;
  *   The ngens is an input parameter which is the second power of
  *   the number of generations to run.
  */
-struct node *root ;
+noderef_t root ;
 int depth ;
-struct node **zeronodea ;
+noderef_t *zeronodea ;
 int nzeros = 0 ;
 /*
  *   Here we calculate 1-square results for 9-square inputs using
@@ -758,12 +795,12 @@ void init() {
    start_life_rules() ;
    hashprime = nextprime(hashprime) ;
    hashlimit = hashprime ;
-   hashtab = calloc(hashprime, sizeof(struct node *)) ;
-   alloced += hashprime * sizeof(struct node *) ;
+   hashtab = calloc(hashprime, sizeof(noderef_t)) ;
+   alloced += hashprime * sizeof(noderef_t) ;
 /*
  *   We initialize our universe to be a 16-square.
  */
-   root = (struct node *)newclearednode() ;
+   root = newclearednode() ;
    depth = 3 ;
 }
 /*
@@ -772,29 +809,30 @@ void init() {
  *   be called after we've started hashing.
  */
 void pushroot_1() {
-   struct node *t ;
-   t = newclearednode() ;
-   t->se = root->nw ;
-   root->nw = t ;
-   t = newclearednode() ;
-   t->sw = root->ne ;
-   root->ne = t ;
-   t = newclearednode() ;
-   t->ne = root->sw ;
-   root->sw = t ;
-   t = newclearednode() ;
-   t->nw = root->se ;
-   root->se = t ;
+   noderef_t tr;
+   struct node *t, *r = deref(root) ;
+   tr = newclearednode() ; t = deref(tr);
+   t->se = r->nw ;
+   r->nw = tr ;
+   tr = newclearednode() ; t = deref(tr);
+   t->sw = r->ne ;
+   r->ne = tr ;
+   tr = newclearednode() ; t = deref(tr);
+   t->ne = r->sw ;
+   r->sw = tr ;
+   tr = newclearednode() ; t = deref(tr);
+   t->nw = r->se ;
+   r->se = tr ;
    depth++ ;
 }
 /*
  *   Return the depth of this node (2 is 8x8).
  */
-int node_depth(struct node *n) {
+int node_depth(noderef_t n) {
    int depth = 2 ;
-   while (is_node(n)) {
+   while (is_node(deref(n))) {
       depth++ ;
-      n = n->nw ;
+      n = deref(n)->nw ;
    }
    return depth ;
 }
@@ -802,20 +840,20 @@ int node_depth(struct node *n) {
  *   This routine returns the canonical clear space node at a particular
  *   depth.
  */
-struct node *zeronode(int depth) {
+noderef_t zeronode(int depth) {
    while (depth >= nzeros) {
       int nnzeros = 2 * nzeros + 10 ;
-      zeronodea = (struct node **)realloc(zeronodea,
-                                          nnzeros * sizeof(struct node *)) ;
-      alloced += (nnzeros - nzeros) * sizeof(struct node *) ;
+      zeronodea = (noderef_t *)realloc(zeronodea,
+                                       nnzeros * sizeof(noderef_t)) ;
+      alloced += (nnzeros - nzeros) * sizeof(noderef_t) ;
       while (nzeros < nnzeros)
          zeronodea[nzeros++] = 0 ;
    }
    if (zeronodea[depth] == 0) {
       if (depth == 2) {
-         zeronodea[depth] = (struct node *)find_leaf(0, 0, 0, 0) ;
+         zeronodea[depth] = find_leaf(0, 0, 0, 0) ;
       } else {
-         struct node *z = zeronode(depth-1) ;
+         noderef_t z = zeronode(depth-1) ;
          zeronodea[depth] = find_node(z, z, z, z) ;
       }
    }
@@ -824,9 +862,10 @@ struct node *zeronode(int depth) {
 /*
  *   Same, but with hashed nodes.
  */
-struct node *pushroot(struct node *n) {
-   int depth = node_depth(n) ;
-   struct node *z = zeronode(depth-1) ;
+noderef_t pushroot(noderef_t nr) {
+   struct node *n = deref(nr);
+   int depth = node_depth(nr) ;
+   noderef_t z = zeronode(depth-1) ;
    return find_node(find_node(z, z, z, n->nw),
                     find_node(z, z, n->ne, z),
                     find_node(z, n->sw, z, z),
@@ -842,9 +881,9 @@ struct node *pushroot(struct node *n) {
  *   and has not been canonicalized, and that many of the pointers in
  *   the nodes can be null.  We'll path this up in due course.
  */
-void setbit(struct node *n, int x, int y, int depth) {
+void setbit(noderef_t nr, int x, int y, int depth) {
    if (depth == 2) {
-      struct leaf *l = (struct leaf *)n ;
+      struct leaf *l = (struct leaf *)deref(nr) ;
       if (x < 0)
          if (y < 0)
             l->sw |= 1 << (3 - (x & 3) + 4 * (y & 3)) ;
@@ -857,7 +896,8 @@ void setbit(struct node *n, int x, int y, int depth) {
             l->ne |= 1 << (3 - (x & 3) + 4 * (y & 3)) ;
    } else {
       int w = 1 << depth ;
-      struct node **nptr ;
+      noderef_t *nptr ;
+      struct node *n = deref(nr);
       depth-- ;
       if (x < 0) {
          if (y < 0)
@@ -872,7 +912,7 @@ void setbit(struct node *n, int x, int y, int depth) {
       }
       if (*nptr == 0) {
          if (depth == 2)
-            *nptr = (struct node *)newclearedleaf() ;
+            *nptr = newclearedleaf() ;
          else
             *nptr = newclearednode() ;
       }
@@ -895,22 +935,23 @@ void set(int x, int y) {
  *   invoking find_node on each node.  Drops the original universe on
  *   the floor [big deal, it's probably small anyway].
  */
-struct node *hashpattern(struct node *root, int depth) {
-   struct node *r ;
+noderef_t hashpattern(noderef_t root, int depth) {
+   noderef_t r;
    if (root == 0) {
       r = zeronode(depth) ;
    } else if (depth == 2) {
-      struct leaf *n = (struct leaf *)root ;
-      r = (struct node *)find_leaf(n->nw, n->ne, n->sw, n->se) ;
-      n->next = (struct node *)freeleaves ;
-      freeleaves = n ;
+      struct leaf *n = (struct leaf *)deref(root) ;
+      r = find_leaf(n->nw, n->ne, n->sw, n->se) ;
+      n->next = freenodes ;
+      freenodes = root ;
    } else {
       depth-- ;
-      r = find_node(hashpattern(root->nw, depth),
-                    hashpattern(root->ne, depth),
-                    hashpattern(root->sw, depth),
-                    hashpattern(root->se, depth)) ;
-      root->next = freenodes ;
+      struct node *rootn = deref(root);
+      r = find_node(hashpattern(rootn->nw, depth),
+                    hashpattern(rootn->ne, depth),
+                    hashpattern(rootn->sw, depth),
+                    hashpattern(rootn->se, depth)) ;
+      rootn->next = freenodes ;
       freenodes = root ;
    }
    return r ;
@@ -1024,11 +1065,11 @@ void readpicmode(char *line) {
 }
 void readmacrocell(char *line) {
    int n=0, i=1, nw, ne, sw, se, r, d, indlen=0 ;
-   struct node **ind = 0 ;
+   noderef_t *ind = 0 ;
    while (fgets(line, 10000, stdin)) {
       if (i >= indlen) {
          int nlen = i + indlen + 10 ;
-         ind = (struct node **)realloc(ind, sizeof(int) * nlen) ;
+         ind = (noderef_t *)realloc(ind, sizeof(noderef_t) * nlen) ;
          while (indlen < nlen)
             ind[indlen++] = 0 ;
       }
@@ -1062,7 +1103,7 @@ default:       fprintf(stderr, "Saw illegal char %c\n", *p) ;
                exit(10) ;
             }
          }
-         ind[i++] = (struct node *)find_leaf(lnw, lne, lsw, lse) ;
+         ind[i++] = find_leaf(lnw, lne, lsw, lse) ;
       } else {
          n = sscanf(line, "%d %d %d %d %d %d", &d, &nw, &ne, &sw, &se, &r) ;
          if (n == 0)
@@ -1108,21 +1149,27 @@ void readpattern() {
 /*
  *   Pop off any levels we don't need.
  */
-struct node *popzeros(struct node *n) {
-   int depth = node_depth(n) ;
+noderef_t popzeros(noderef_t nr) {
+   int depth = node_depth(nr) ;
    while (depth > 3) {
-      struct node *z = zeronode(depth-2) ;
-      if (n->nw->nw == z && n->nw->ne == z && n->nw->sw == z &&
-          n->ne->nw == z && n->ne->ne == z && n->ne->se == z &&
-          n->sw->nw == z && n->sw->sw == z && n->sw->se == z &&
-          n->se->ne == z && n->se->sw == z && n->se->se == z) {
+      noderef_t z = zeronode(depth-2) ;
+      struct node
+      *n = deref(nr),
+      *nw = deref(n->nw),
+      *ne = deref(n->ne),
+      *sw = deref(n->sw),
+      *se = deref(n->se);
+      if (nw->nw == z && nw->ne == z && nw->sw == z &&
+          ne->nw == z && ne->ne == z && ne->se == z &&
+          sw->nw == z && sw->sw == z && sw->se == z &&
+          se->ne == z && se->sw == z && se->se == z) {
          depth-- ;
-         n = find_node(n->nw->se, n->ne->sw, n->sw->ne, n->se->nw) ;
+         nr = find_node(nw->se, ne->sw, sw->ne, se->nw) ;
       } else {
          break ;
       }
    }
-   return n ;
+   return nr;
 }
 /*
  *   At this point, we're pretty much done.  The remaining routines just
@@ -1263,30 +1310,31 @@ char *stringify(int *n) {
  *   (or abusing) the cache (res) field, and the least significant bit of
  *   the hash next field (as a visited bit).
  */
-#define marked(n) (1 & (uintptr_t)(n)->next)
-#define mark(n) ((n)->next = (struct node *)((uintptr_t)1 | (uintptr_t)(n)->next))
-#define clearmark(n) ((n)->next = (struct node *)(~(uintptr_t)1 & (uintptr_t)(n)->next))
-#define clearmarkbit(p) ((struct node *)(~(uintptr_t)1 & (uintptr_t)(p)))
+#define marked(n) (1 & (n)->next)
+#define mark(n) ((n)->next |= 1)
+#define clearmark(n) ((n)->next &= ~1)
+#define clearmarkbit(p) (~1 & p)
 /*
  *   This recursive routine calculates the population by hanging the
  *   population on marked nodes.
  */
-int *calcpop(struct node *root, int depth) {
+int *calcpop(noderef_t root, int depth) {
    int *r ;
    if (root == zeronode(depth)) {
       return newsmallint(0) ;
    } else if (depth == 2) {
-      struct leaf *n = (struct leaf *)root ;
+      struct leaf *n = (struct leaf *)deref(root) ;
       return newsmallint(shortpop[n->nw] + shortpop[n->ne] +
                          shortpop[n->sw] + shortpop[n->se]) ;
-   } else if (marked(root)) {
-      return (int *)root->res ;
+   } else if (marked(deref(root))) {
+      return deref(root)->resp ;
    } else {
+      struct node *rr = deref(root);
       depth-- ;
-      r = sum4(calcpop(root->nw, depth), calcpop(root->ne, depth),
-               calcpop(root->sw, depth), calcpop(root->se, depth)) ;
-      mark(root) ;
-      root->res = (struct node *)r ;
+      r = sum4(calcpop(rr->nw, depth), calcpop(rr->ne, depth),
+               calcpop(rr->sw, depth), calcpop(rr->se, depth)) ;
+      mark(deref(root)) ;
+      rr->resp = r ;
       return r ;
    }
 }
@@ -1294,13 +1342,14 @@ int *calcpop(struct node *root, int depth) {
  *   After running one of the marking routines, we can clean up by
  *   calling this routine.
  */
-void aftercalcpop(struct node *root, int depth) {
+void aftercalcpop(noderef_t rootr, int depth) {
+   struct node *root = deref(rootr);
    if (marked(root)) {
       if (depth == 2) {
          root->nw = 0 ;
          clearmark(root) ;
       } else {
-         root->res = 0 ;  /* clear cache field! */
+         root->resp = 0 ;  /* clear cache field! */
          clearmark(root) ;
          depth-- ;
          aftercalcpop(root->nw, depth) ;
@@ -1313,7 +1362,7 @@ void aftercalcpop(struct node *root, int depth) {
 /*
  *   This top level routine calculates the population of a universe.
  */
-char *population(struct node *root) {
+char *population(noderef_t root) {
    int depth, *r ;
    resetnummem() ;
    depth = node_depth(root) ;
@@ -1338,12 +1387,13 @@ void unpack8x8(unsigned short nw, unsigned short ne, unsigned short sw,
  */
 int cellcounter = 0 ;
 FILE *macro ;
-void writecell(struct node *root, int depth) {
+void writecell(noderef_t rootr, int depth) {
    int thiscell = 0 ;
+   struct node *root = deref(rootr);
    if (marked(root))
       return ;
    mark(root) ;
-   if (root == zeronode(depth)) {
+   if (rootr == zeronode(depth)) {
       if (depth == 2)
          root->nw = 0 ;
       else
@@ -1353,7 +1403,7 @@ void writecell(struct node *root, int depth) {
       unsigned int top, bot ;
       struct leaf *n = (struct leaf *)root ;
       thiscell = ++cellcounter ;
-      root->nw = (struct node *)thiscell ;
+      root->nw = (noderef_t) thiscell ;
       unpack8x8(n->nw, n->ne, n->sw, n->se, &top, &bot) ;
       for (j=7; (top | bot) && j>=0; j--) {
          int bits = (top >> 24) ;
@@ -1373,15 +1423,15 @@ void writecell(struct node *root, int depth) {
       writecell(root->sw, depth-1) ;
       writecell(root->se, depth-1) ;
       thiscell = ++cellcounter ;
-      root->res = (struct node *)thiscell ;
+      root->res = (noderef_t) thiscell ;
       if (depth > 3) {
          fprintf(macro, "%d %d %d %d %d\n", depth+1,
-                         (int)root->nw->res, (int)root->ne->res,
-                         (int)root->sw->res, (int)root->se->res) ;
+                         (int)deref(root->nw)->res, (int)deref(root->ne)->res,
+                         (int)deref(root->sw)->res, (int)deref(root->se)->res) ;
       } else
          fprintf(macro, "%d %d %d %d %d\n", depth+1,
-                         (int)root->nw->nw, (int)root->ne->nw,
-                         (int)root->sw->nw, (int)root->se->nw) ;
+                         (int)deref(root->nw)->nw, (int)deref(root->ne)->nw,
+                         (int)deref(root->sw)->nw, (int)deref(root->se)->nw) ;
    }
 }
 int *maxgens, *incgens, *gen, *tmain ;
@@ -1412,16 +1462,16 @@ void writeout(char *filename, int argc, char *argv[]) {
  *   we want to preserve.  Nodes not reachable from here, we allow to
  *   be freed.  Same with leaves.
  */
-struct node **stack ;
+noderef_t *stack ;
 int stacksize ;
 /*
  *   This routine marks a node as needed to be saved.
  */
-struct node *save(struct node *n) {
+noderef_t save(noderef_t n) {
    if (gsp >= stacksize) {
       int nstacksize = stacksize * 2 + 100 ;
-      alloced += sizeof(struct node *)*(nstacksize-stacksize) ;
-      stack = realloc(stack, nstacksize * sizeof(struct node *)) ;
+      alloced += sizeof(noderef_t)*(nstacksize-stacksize) ;
+      stack = realloc(stack, nstacksize * sizeof(noderef_t)) ;
       stacksize = nstacksize ;
    }
    stack[gsp++] = n ;
@@ -1446,7 +1496,8 @@ void clearstack() {
  *   the nodes from the hash to the freelist as appropriate.  Finally,
  *   walk the hash again, clearing the low order bits in the next pointers.
  */
-void gc_mark(struct node *root) {
+void gc_mark(noderef_t rootr) {
+   struct node *root = deref(rootr);
    if (!marked(root)) {
       mark(root) ;
       if (is_node(root)) {
@@ -1460,10 +1511,9 @@ void gc_mark(struct node *root) {
    }
 }
 void do_gc(int why) {
-   int i ;
-   unsigned int freed_nodes=0, freed_leaves=0 ;
-   struct node *p, *pp ;
-   struct leaf *l, *ll ;
+   int i, j;
+   unsigned int freed_nodes=0;
+   union nodeleaf *n;
    struct timeval t1, t2;
    gettimeofday(&t1, NULL);
    fprintf(stderr, "[%c%d", why, hashpop/(totalthings/100)) ;
@@ -1472,31 +1522,21 @@ void do_gc(int why) {
    hashpop = 0 ;
    memset(hashtab, 0, sizeof(struct node *) * hashprime) ;
    fprintf(stderr, ":") ;
-   freeleaves = 0 ;
-   for (l=leafblocks; l; l=(struct leaf *)(l->next))
-      for (ll=l+1, i=1; i<1001; i++, ll++) {
-         if (marked(ll)) {
-            int h = leaf_hash(ll->nw, ll->ne, ll->sw, ll->se) % hashprime ;
-            ll->next = hashtab[h] ;
-            hashtab[h] = (struct node *)ll ;
-            hashpop++ ;
-         } else {
-            ll->next = (struct node *)freeleaves ;
-            freeleaves = ll ;
-            freed_leaves++ ;
-         }
-      }
    freenodes = 0 ;
-   for (p=nodeblocks; p; p=p->next)
-      for (pp=p+1, i=1; i<1001; i++, pp++) {
-         if (marked(pp)) {
-            int h = node_hash(pp->nw, pp->ne, pp->sw, pp->se) % hashprime ;
-            pp->next = hashtab[h] ;
-            hashtab[h] = pp ;
+   for (n = allocs[1], i = 0; i < curallocblk; i++, n++)
+      for (j = 0; j < ALLOCSZ; j++) {
+         if (marked(&(n[j].l))) {
+            int h;
+            if (n[j].l.isnode)
+              h = leaf_hash(n[j].l.nw, n[j].l.ne, n[j].l.sw, n[j].l.se) % hashprime ;
+            else
+              h = node_hash(n[j].n.nw, n[j].n.ne, n[j].n.sw, n[j].n.se) % hashprime ;
+            n[j].n.next = hashtab[h] ;
+            hashtab[h] = ref(i+1, j) ;
             hashpop++ ;
          } else {
-            pp->next = freenodes ;
-            freenodes = pp ;
+            n[j].n.next = freenodes ;
+            freenodes = ref(i+1, j) ;
             freed_nodes++ ;
          }
       }
@@ -1507,7 +1547,8 @@ void do_gc(int why) {
  *   Clear the cache bits down to the appropriate level, marking the
  *   nodes we've handled.
  */
-void clearcache(struct node *n, int depth, int clearto) {
+void clearcache(noderef_t nr, int depth, int clearto) {
+   struct node *n = deref(nr);
    if (!marked(n)) {
       mark(n) ;
       if (depth > 3) {
@@ -1529,8 +1570,9 @@ void clearcache(struct node *n, int depth, int clearto) {
  *   values.
  */
 void new_ngens(int newval) {
-   int i ;
-   struct node *p, *pp ;
+   int i, n, j ;
+   noderef_t p, pp;
+   struct node *sp;
    int clearto = ngens ;
    if (newval > ngens && halvesdone == 0) {
       ngens = newval ;
@@ -1544,13 +1586,13 @@ void new_ngens(int newval) {
       clearto = 3 ;
    ngens = newval ;
    for (i=0; i<hashprime; i++)
-      for (p=hashtab[i]; p; p=clearmarkbit(p->next))
-         if (is_node(p) && !marked(p))
+      for (p=hashtab[i]; p && (sp = deref(p)); p=clearmarkbit(sp->next))
+         if (is_node(sp) && !marked(sp))
             clearcache(p, node_depth(p), clearto) ;
    fprintf(stderr, "%d", halvesdone) ;
-   for (p=nodeblocks; p; p=p->next)
-      for (pp=p+1, i=1; i<1001; i++, pp++)
-         clearmark(pp) ;
+   for (i = 0; i < curallocblk; i++)
+      for (j = 0; j < ALLOCSZ; j++)
+         clearmark(&(allocs[i+1][j].n));
    fprintf(stderr, ">") ;
    halvesdone = 0 ;
 }
@@ -1690,9 +1732,9 @@ int *parseint(int **what, char *s) {
  *   magic top-level routine passing in clearspace borders that are
  *   guaranteed large enough.
  */
-struct node *runpattern(struct node *n) {
+noderef_t runpattern(noderef_t n) {
    int depth = node_depth(n) ;
-   struct node *n2 ;
+   noderef_t n2 ;
    n = pushroot(n) ;
    depth++ ;
    n = pushroot(n) ;
@@ -1708,7 +1750,7 @@ struct node *runpattern(struct node *n) {
    okaytogc = 0 ;
    clearstack() ;
    if (halvesdone == 1) {
-      n->res = 0 ;
+      deref(n)->resp = 0 ;
       halvesdone = 0 ;
    }
    n = popzeros(n2) ;
