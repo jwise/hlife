@@ -114,10 +114,7 @@ typedef uint32_t noderef_t;
 struct node {
    noderef_t next ;              /* hash link */
    noderef_t nw, ne, sw, se; /* constant; nw != 0 means nonleaf */
-   union {
-     noderef_t res ;               /* cache */
-     int *resp; /* Sigh. */
-   };
+   noderef_t res ;               /* cache */
 } ;
 /*
  *   For the 8-squares, we do not have `children', we have actual data
@@ -1340,10 +1337,16 @@ char *stringify(int *n) {
    }
    return tstringify ;
 }
+
 /*
  *   This recursive routine calculates the population by hanging the
  *   population on marked nodes.
  */
+
+int **respcache = NULL;
+int nrespcache = 0;
+int respcachesz = 0;
+
 int *calcpop(noderef_t root, int depth) {
    int *r ;
    if (root == zeronode(depth)) {
@@ -1353,14 +1356,23 @@ int *calcpop(noderef_t root, int depth) {
       return newsmallint(shortpop[n->nw] + shortpop[n->ne] +
                          shortpop[n->sw] + shortpop[n->se]) ;
    } else if (marked(root)) {
-      return deref(root)->resp ;
+      return respcache[deref(root)->res] ;
    } else {
       struct node *rr = deref(root);
       depth-- ;
       r = sum4(calcpop(rr->nw, depth), calcpop(rr->ne, depth),
                calcpop(rr->sw, depth), calcpop(rr->se, depth)) ;
       mark(root) ;
-      rr->resp = r ;
+      
+      if (nrespcache + 1 > respcachesz) {
+         if (!respcachesz)
+            respcachesz++;
+         respcachesz *= 2;
+         respcache = realloc(respcache, respcachesz * sizeof(int *));
+      }
+      
+      respcache[nrespcache] = r;
+      rr->res = nrespcache++;
       return r ;
    }
 }
@@ -1375,7 +1387,7 @@ void aftercalcpop(noderef_t rootr, int depth) {
          root->nw = 0 ;
          clearmark(rootr) ;
       } else {
-         root->resp = 0 ;  /* clear cache field! */
+         root->res = 0 ;  /* clear cache field! */
          clearmark(rootr) ;
          depth-- ;
          aftercalcpop(root->nw, depth) ;
@@ -1394,6 +1406,9 @@ char *population(noderef_t root) {
    depth = node_depth(root) ;
    r = calcpop(root, depth) ;
    aftercalcpop(root, depth) ;
+   free(respcache);
+   respcache = NULL;
+   nrespcache = respcachesz = 0;
    return stringify(r) ;
 }
 /*
@@ -1776,7 +1791,7 @@ noderef_t runpattern(noderef_t n) {
    okaytogc = 0 ;
    clearstack() ;
    if (halvesdone == 1) {
-      deref(n)->resp = 0 ;
+      deref(n)->res = 0 ;
       halvesdone = 0 ;
    }
    n = popzeros(n2) ;
