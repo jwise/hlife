@@ -156,13 +156,11 @@ union nodeleaf {
   struct leaf l;
   struct node n;
 };
-union nodeleaf **allocs = NULL;
-uint8_t **alloc_gc = NULL;
-int nallocs = 0;
-#define ALLOCSZ 0x400
-#define deref(nr)   ({noderef_t __NR = (nr); &(allocs[(__NR) >> 10][(__NR) & 0x3FF].n);})
-#define deref_l(nr) ({noderef_t __NR = (nr); &(allocs[(__NR) >> 10][(__NR) & 0x3FF].l);})
-#define ref(a, p) (((a) << 10) | (p))
+union nodeleaf *allocs = NULL;
+uint8_t *alloc_gc = NULL;
+#define ALLOCSZ 1024
+#define deref(nr)   (&(allocs[nr].n))
+#define deref_l(nr) (&(allocs[nr].l))
 
 /*
  *   A lot of the routines from here on down traverse the universe, hanging
@@ -172,7 +170,7 @@ int nallocs = 0;
  */
 #define markbit(nr) (1 << (nr % 8))
 /* explicitly an lvalue! */
-#define markp(nr) (alloc_gc[(nr) >> 10][((nr) & 0x3FF) / 8])
+#define markp(nr) (alloc_gc[nr / 8])
 #define marked(nr) ({noderef_t __NR = (nr); markp(__NR) & markbit(__NR);})
 #define mark(nr) ({noderef_t __NR = (nr); markp(__NR) |= markbit(__NR);})
 #define clearmark(nr) ({noderef_t __NR = (nr); markp(__NR) &= ~markbit(__NR);})
@@ -671,32 +669,29 @@ int curallocblk = 0;
 noderef_t freenodes = 0;
 int okaytogc = 0 ;           /* only true when we're running generations. */
 int totalthings = 0 ;
+int navail = 0;
 noderef_t newnode() {
    noderef_t r;
    if (freenodes == 0) {
       int i ;
       
-      curallocblk++;
-      if (curallocblk >= nallocs) {
-         if (!nallocs)
-            nallocs = 1;
-         nallocs *= 2;
-         allocs = realloc(allocs, sizeof(union nodeleaf *) * nallocs);
-         allocs[0] = NULL;
-         alloc_gc = realloc(alloc_gc, sizeof(uint8_t *) * nallocs);
-         alloc_gc[0] = NULL;
+      freenodes = curallocblk * ALLOCSZ;
+      if (totalthings > navail) {
+         fprintf(stderr, "Even a GC didn't save us, and I'm *really* out of memory!\n");
+         exit(11);
       }
-      allocs[curallocblk] = calloc(ALLOCSZ, sizeof(union nodeleaf));
-      alloc_gc[curallocblk] = calloc(ALLOCSZ / 8, sizeof(uint8_t));
-      freenodes = ref(curallocblk, 0);
-      alloced += ALLOCSZ * sizeof(union nodeleaf) ;
+      if (freenodes == 0)
+         freenodes++;
+      alloced += ALLOCSZ * sizeof(union nodeleaf);
       alloced += ALLOCSZ / 8 * sizeof(uint8_t);
       for (i = 0; i < ALLOCSZ; i++)
-         allocs[curallocblk][i].n.next = ref(curallocblk, i+1);
-      allocs[curallocblk][ALLOCSZ-1].n.next = 0;
+         allocs[curallocblk * ALLOCSZ + i].n.next = curallocblk * ALLOCSZ + i + 1;
+      allocs[curallocblk * ALLOCSZ + ALLOCSZ-1].n.next = 0;
+      memset(alloc_gc + curallocblk * ALLOCSZ / 8, 0, ALLOCSZ / 8);
       if (alloced > maxmem)
          fprintf(stderr, "N") ;
       totalthings += ALLOCSZ ;
+      curallocblk++;
    }
    if (deref(freenodes)->next == 0 &&
        alloced + ALLOCSZ * sizeof(union nodeleaf) > maxmem &&
@@ -819,6 +814,11 @@ void init() {
    hashlimit = hashprime ;
    hashtab = calloc(hashprime, sizeof(noderef_t)) ;
    alloced += hashprime * sizeof(noderef_t) ;
+   
+   /* Woo, sparse memory! */
+   allocs = malloc(maxmem);
+   alloc_gc = malloc(maxmem / sizeof(union nodeleaf) / 8);
+   navail = maxmem / sizeof(union nodeleaf);
 /*
  *   We initialize our universe to be a 16-square.
  */
@@ -1529,32 +1529,29 @@ void do_gc(int why) {
    struct timeval t1, t2;
    gettimeofday(&t1, NULL);
    fprintf(stderr, "[%c%d", why, hashpop/(totalthings/100)) ;
-   for (i = 1; i <= curallocblk; i++)
-      memset(alloc_gc[i], 0, ALLOCSZ/8);
+   memset(alloc_gc, 0, totalthings / 8);
    for (i=0; i<gsp; i++)
       gc_mark(stack[i]) ;
    hashpop = 0 ;
    memset(hashtab, 0, sizeof(noderef_t) * hashprime) ;
    fprintf(stderr, ":") ;
    freenodes = 0 ;
-   for (i = 1; i <= curallocblk; i++)
-      for (j = 0; j < ALLOCSZ; j++) {
-         if (marked(ref(i, j))) {
-            int h;
-            if (allocs[i][j].l.isnode)
-              h = leaf_hash(allocs[i][j].l.nw, allocs[i][j].l.ne, allocs[i][j].l.sw, allocs[i][j].l.se) % hashprime ;
-            else
-              h = node_hash(allocs[i][j].n.nw, allocs[i][j].n.ne, allocs[i][j].n.sw, allocs[i][j].n.se) % hashprime ;
-            allocs[i][j].n.next = hashtab[h] ;
-            hashtab[h] = ref(i, j) ;
-            hashpop++ ;
-         } else {
-            allocs[i][j].n.next = freenodes ;
-            freenodes = ref(i, j) ;
-            freed_nodes++ ;
-         }
-         clearmark(ref(i, j));
+   for (i = 1; i < totalthings; i++)
+      if (marked(i)) {
+         int h;
+         if (allocs[i].l.isnode)
+           h = leaf_hash(allocs[i].l.nw, allocs[i].l.ne, allocs[i].l.sw, allocs[i].l.se) % hashprime ;
+         else
+           h = node_hash(allocs[i].n.nw, allocs[i].n.ne, allocs[i].n.sw, allocs[i].n.se) % hashprime ;
+         allocs[i].n.next = hashtab[h] ;
+         hashtab[h] = i ;
+         hashpop++ ;
+      } else {
+         allocs[i].n.next = freenodes ;
+         freenodes = i ;
+         freed_nodes++ ;
       }
+   memset(alloc_gc, 0, curallocblk * ALLOCSZ / 8);
    gettimeofday(&t2, NULL);
    fprintf(stderr, "%u@%ldus]", hashpop/(totalthings/100), (t2.tv_sec-t1.tv_sec)*1000000+(t2.tv_usec-t1.tv_usec));
 }
@@ -1605,8 +1602,7 @@ void new_ngens(int newval) {
          if (is_node(sp) && !marked(p))
             clearcache(p, node_depth(p), clearto) ;
    fprintf(stderr, "%d", halvesdone) ;
-   for (i = 1; i <= curallocblk; i++)
-      memset(alloc_gc[i], 0, ALLOCSZ/8);
+   memset(alloc_gc, 0, totalthings/8);
    fprintf(stderr, ">") ;
    halvesdone = 0 ;
 }
