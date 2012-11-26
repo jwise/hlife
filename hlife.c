@@ -690,6 +690,7 @@ noderef_t newnode() {
       alloc_gc[curallocblk] = calloc(ALLOCSZ / 8, sizeof(uint8_t));
       freenodes = ref(curallocblk, 0);
       alloced += ALLOCSZ * sizeof(union nodeleaf) ;
+      alloced += ALLOCSZ / 8 * sizeof(uint8_t);
       for (i = 0; i < ALLOCSZ; i++)
          allocs[curallocblk][i].n.next = ref(curallocblk, i+1);
       allocs[curallocblk][ALLOCSZ-1].n.next = 0;
