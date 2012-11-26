@@ -19,6 +19,10 @@
 #include <string.h>
 #include <inttypes.h>
 #include <sys/time.h>
+#include <sys/mman.h>
+
+#define PAGE_SIZE (2097152ULL)
+
 /*
  *   Into instances of this node structure is where almost all of the
  *   memory allocated by this program goes.  Thus, it is imperative we
@@ -815,9 +819,19 @@ void init() {
    hashtab = calloc(hashprime, sizeof(noderef_t)) ;
    alloced += hashprime * sizeof(noderef_t) ;
    
-   /* Woo, sparse memory! */
-   allocs = malloc(maxmem);
-   alloc_gc = malloc(maxmem / sizeof(union nodeleaf) / 8);
+   /* Let the OS take care of making the pages sparse for us. */
+   allocs = mmap(NULL, (maxmem + PAGE_SIZE) & ~(PAGE_SIZE - 1), PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+   if (allocs == MAP_FAILED) {
+      fprintf(stderr, "unable to allocate enough memory\n");
+      exit(12);
+   }
+
+   alloc_gc = mmap(NULL, (maxmem / sizeof(union nodeleaf) / 8 + PAGE_SIZE) & ~(PAGE_SIZE - 1), PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+   if (alloc_gc == MAP_FAILED) {
+      fprintf(stderr, "unable to allocate enough memory\n");
+      exit(12);
+   }
+
    navail = maxmem / sizeof(union nodeleaf);
 /*
  *   We initialize our universe to be a 16-square.
@@ -1523,7 +1537,7 @@ void gc_mark(noderef_t rootr) {
    }
 }
 void do_gc(int why) {
-   int i, j;
+   noderef_t i;
    unsigned int freed_nodes=0;
    union nodeleaf *n;
    struct timeval t1, t2;
@@ -1535,6 +1549,7 @@ void do_gc(int why) {
    hashpop = 0 ;
    memset(hashtab, 0, sizeof(noderef_t) * hashprime) ;
    fprintf(stderr, ":") ;
+   
    freenodes = 0 ;
    for (i = 1; i < totalthings; i++)
       if (marked(i)) {
@@ -1551,6 +1566,7 @@ void do_gc(int why) {
          freenodes = i ;
          freed_nodes++ ;
       }
+   
    memset(alloc_gc, 0, curallocblk * ALLOCSZ / 8);
    gettimeofday(&t2, NULL);
    fprintf(stderr, "%u@%ldus]", hashpop/(totalthings/100), (t2.tv_sec-t1.tv_sec)*1000000+(t2.tv_usec-t1.tv_usec));
