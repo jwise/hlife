@@ -150,17 +150,6 @@ struct leaf {
  */
 #define is_node(n) (((struct leaf *)(n))->isnode)
 
-/*
- *   A lot of the routines from here on down traverse the universe, hanging
- *   information off the nodes.  The way they generally do so is by using
- *   (or abusing) the cache (res) field, and the least significant bit of
- *   the hash next field (as a visited bit).
- */
-#define marked(n) (1 & (n)->next)
-#define mark(n) ((n)->next |= 1)
-#define clearmark(n) ((n)->next &= ~1)
-#define clearmarkbit(p) (~1 & p)
-
 
 /* The allocations come in generations -- to make it easier to look up a certain node or leaf, we put them in a union... */
 union nodeleaf {
@@ -168,11 +157,25 @@ union nodeleaf {
   struct node n;
 };
 union nodeleaf **allocs = NULL;
+uint8_t **alloc_gc = NULL;
 int nallocs = 0;
 #define ALLOCSZ 0x400
-#define deref(nr)   ({noderef_t __NR = (nr); &(allocs[(__NR) >> 11][((__NR) >> 1) & 0x3FF].n);})
-#define deref_l(nr) ({noderef_t __NR = (nr); &(allocs[(__NR) >> 11][((__NR) >> 1) & 0x3FF].l);})
-#define ref(a, p) (((a) << 11) | ((p) << 1))
+#define deref(nr)   ({noderef_t __NR = (nr); &(allocs[(__NR) >> 10][(__NR) & 0x3FF].n);})
+#define deref_l(nr) ({noderef_t __NR = (nr); &(allocs[(__NR) >> 10][(__NR) & 0x3FF].l);})
+#define ref(a, p) (((a) << 10) | (p))
+
+/*
+ *   A lot of the routines from here on down traverse the universe, hanging
+ *   information off the nodes.  The way they generally do so is by using
+ *   (or abusing) the cache (res) field, and the least significant bit of
+ *   the hash next field (as a visited bit).
+ */
+#define markbit(nr) (1 << (nr % 8))
+/* explicitly an lvalue! */
+#define markp(nr) (alloc_gc[(nr) >> 10][((nr) & 0x3FF) / 8])
+#define marked(nr) ({noderef_t __NR = (nr); markp(__NR) & markbit(__NR);})
+#define mark(nr) ({noderef_t __NR = (nr); markp(__NR) |= markbit(__NR);})
+#define clearmark(nr) ({noderef_t __NR = (nr); markp(__NR) &= ~markbit(__NR);})
 
 /*
  *   A key datastructure is our hash table; we use a simple bucket hash.
@@ -659,6 +662,7 @@ noderef_t dorecurs_leaf_quarter(noderef_t nr, noderef_t ner, noderef_t tr, noder
  */
 int die_if_gc ;
 void do_gc() ;
+
 /*
  *   We keep free nodes in a linked list for allocation, and we allocate
  *   them 1000 at a time.
@@ -669,7 +673,7 @@ int okaytogc = 0 ;           /* only true when we're running generations. */
 int totalthings = 0 ;
 noderef_t newnode() {
    noderef_t r;
-   if (clearmarkbit(freenodes) == 0) {
+   if (freenodes == 0) {
       int i ;
       
       curallocblk++;
@@ -679,18 +683,21 @@ noderef_t newnode() {
          nallocs *= 2;
          allocs = realloc(allocs, sizeof(union nodeleaf *) * nallocs);
          allocs[0] = NULL;
+         alloc_gc = realloc(alloc_gc, sizeof(uint8_t *) * nallocs);
+         alloc_gc[0] = NULL;
       }
       allocs[curallocblk] = calloc(ALLOCSZ, sizeof(union nodeleaf));
-      freenodes = curallocblk << 11;
+      alloc_gc[curallocblk] = calloc(ALLOCSZ / 8, sizeof(uint8_t));
+      freenodes = ref(curallocblk, 0);
       alloced += ALLOCSZ * sizeof(union nodeleaf) ;
       for (i = 0; i < ALLOCSZ; i++)
-         allocs[curallocblk][i].n.next = (curallocblk << 11) | ((i + 1) << 1);
+         allocs[curallocblk][i].n.next = ref(curallocblk, i+1);
       allocs[curallocblk][ALLOCSZ-1].n.next = 0;
       if (alloced > maxmem)
          fprintf(stderr, "N") ;
       totalthings += ALLOCSZ ;
    }
-   if (clearmarkbit(deref(freenodes)->next) == 0 &&
+   if (deref(freenodes)->next == 0 &&
        alloced + ALLOCSZ * sizeof(union nodeleaf) > maxmem &&
        okaytogc) {
       if (die_if_gc) {
@@ -1330,14 +1337,14 @@ int *calcpop(noderef_t root, int depth) {
       struct leaf *n = (struct leaf *)deref(root) ;
       return newsmallint(shortpop[n->nw] + shortpop[n->ne] +
                          shortpop[n->sw] + shortpop[n->se]) ;
-   } else if (marked(deref(root))) {
+   } else if (marked(root)) {
       return deref(root)->resp ;
    } else {
       struct node *rr = deref(root);
       depth-- ;
       r = sum4(calcpop(rr->nw, depth), calcpop(rr->ne, depth),
                calcpop(rr->sw, depth), calcpop(rr->se, depth)) ;
-      mark(deref(root)) ;
+      mark(root) ;
       rr->resp = r ;
       return r ;
    }
@@ -1348,13 +1355,13 @@ int *calcpop(noderef_t root, int depth) {
  */
 void aftercalcpop(noderef_t rootr, int depth) {
    struct node *root = deref(rootr);
-   if (marked(root)) {
+   if (marked(rootr)) {
       if (depth == 2) {
          root->nw = 0 ;
-         clearmark(root) ;
+         clearmark(rootr) ;
       } else {
          root->resp = 0 ;  /* clear cache field! */
-         clearmark(root) ;
+         clearmark(rootr) ;
          depth-- ;
          aftercalcpop(root->nw, depth) ;
          aftercalcpop(root->ne, depth) ;
@@ -1394,9 +1401,9 @@ FILE *macro ;
 void writecell(noderef_t rootr, int depth) {
    int thiscell = 0 ;
    struct node *root = deref(rootr);
-   if (marked(root))
+   if (marked(rootr))
       return ;
-   mark(root) ;
+   mark(rootr) ;
    if (rootr == zeronode(depth)) {
       if (depth == 2)
          root->nw = 0 ;
@@ -1502,8 +1509,8 @@ void clearstack() {
  */
 void gc_mark(noderef_t rootr) {
    struct node *root = deref(rootr);
-   if (!marked(root)) {
-      mark(root) ;
+   if (!marked(rootr)) {
+      mark(rootr) ;
       if (is_node(root)) {
          gc_mark(root->nw) ;
          gc_mark(root->ne) ;
@@ -1522,8 +1529,7 @@ void do_gc(int why) {
    gettimeofday(&t1, NULL);
    fprintf(stderr, "[%c%d", why, hashpop/(totalthings/100)) ;
    for (i = 1; i <= curallocblk; i++)
-      for (j = 0; j < ALLOCSZ; j++)
-         clearmark(&(allocs[i][j].l));
+      memset(alloc_gc[i], 0, ALLOCSZ/8);
    for (i=0; i<gsp; i++)
       gc_mark(stack[i]) ;
    hashpop = 0 ;
@@ -1532,7 +1538,7 @@ void do_gc(int why) {
    freenodes = 0 ;
    for (i = 1; i <= curallocblk; i++)
       for (j = 0; j < ALLOCSZ; j++) {
-         if (marked(&(allocs[i][j].l))) {
+         if (marked(ref(i, j))) {
             int h;
             if (allocs[i][j].l.isnode)
               h = leaf_hash(allocs[i][j].l.nw, allocs[i][j].l.ne, allocs[i][j].l.sw, allocs[i][j].l.se) % hashprime ;
@@ -1546,7 +1552,7 @@ void do_gc(int why) {
             freenodes = ref(i, j) ;
             freed_nodes++ ;
          }
-         clearmark(&(allocs[i][j].l));
+         clearmark(ref(i, j));
       }
    gettimeofday(&t2, NULL);
    fprintf(stderr, "%u@%ldus]", hashpop/(totalthings/100), (t2.tv_sec-t1.tv_sec)*1000000+(t2.tv_usec-t1.tv_usec));
@@ -1557,8 +1563,8 @@ void do_gc(int why) {
  */
 void clearcache(noderef_t nr, int depth, int clearto) {
    struct node *n = deref(nr);
-   if (!marked(n)) {
-      mark(n) ;
+   if (!marked(nr)) {
+      mark(nr) ;
       if (depth > 3) {
          depth-- ;
          clearcache(n->nw, depth, clearto) ;
@@ -1594,13 +1600,12 @@ void new_ngens(int newval) {
       clearto = 3 ;
    ngens = newval ;
    for (i=0; i<hashprime; i++)
-      for (p=hashtab[i]; p && (sp = deref(p)); p=clearmarkbit(sp->next))
-         if (is_node(sp) && !marked(sp))
+      for (p=hashtab[i]; p && (sp = deref(p)); p=sp->next)
+         if (is_node(sp) && !marked(p))
             clearcache(p, node_depth(p), clearto) ;
    fprintf(stderr, "%d", halvesdone) ;
    for (i = 1; i <= curallocblk; i++)
-      for (j = 0; j < ALLOCSZ; j++)
-         clearmark(&(allocs[i][j].n));
+      memset(alloc_gc[i], 0, ALLOCSZ/8);
    fprintf(stderr, ">") ;
    halvesdone = 0 ;
 }
